@@ -1,0 +1,16 @@
+matplotlib==3.9.2
+numpy==2.1.3
+pandas==2.2.3
+scikit_learn==1.5.2
+scipy==1.14.1
+torch
+torchaudio
+torchmetrics==1.4.0.post0
+tqdm==4.66.4
+
+project_path = './'
+# data_path = './data/'
+data_path = '/data/glue/drones/preprocessed/iq_and_spec/long/sigfreq_2440_samplefreq_14_inputlength_1048576_normsignal_carrier_normnoise_mean_movavgwinsize_256/'
+
+# read statistics/class count of the dataset
+dataset_stats = pd.read_csv(data_path + 'class_stats.csv', index_col=0)
