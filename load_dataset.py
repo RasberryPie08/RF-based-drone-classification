@@ -205,8 +205,8 @@ def plot_input_data_powerspec(spectrogram_2d, iq_2d, title='', n_fft=1024, win_l
 
 
 project_path = './'
-data_path = './data/'
-# data_path = '/data/glue/drones/preprocessed/iq_and_spec/long/sigfreq_2440_samplefreq_14_inputlength_1048576_normsignal_carrier_normnoise_mean_movavgwinsize_256/'
+# data_path = './data/'
+data_path = '/data/glue/drones/preprocessed/iq_and_spec/long/sigfreq_2440_samplefreq_14_inputlength_1048576_normsignal_carrier_normnoise_mean_movavgwinsize_256/'
 
 # read statistics/class count of the dataset
 dataset_stats = pd.read_csv(data_path + 'class_stats.csv', index_col=0)

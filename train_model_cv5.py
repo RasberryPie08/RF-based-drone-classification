@@ -19,6 +19,7 @@ import torch.backends.cudnn as cudnn
 from tqdm import tqdm  # progressbar
 import torchmetrics
 import pickle as pkl
+import torchvision.models as models
 
 
 class drone_data_dataset(Dataset):
@@ -124,28 +125,56 @@ def plot_two_channel_iq(iq_2d, title='', figsize=(10,6)):
 
 
 def get_model_spec(model_name, num_classes):
-    if(model_name == 'vgg11'):
+    if model_name == 'resnet18':
+        # Load the ResNet-18 architecture. pretrained=False means random initialization.
+        # Set pretrained=True if you want to leverage ImageNet weights (might need adjustment)
+        model = models.resnet18(weights=None) # Use weights=None for random init
+
+        # --- Modify the first convolutional layer for 2-channel input ---
+        # Original ResNet-18 conv1: nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # We need to change the input channels from 3 to 2
+        original_conv1 = model.conv1
+        model.conv1 = nn.Conv2d(
+            in_channels=2, # Change this from 3 to 2
+            out_channels=original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=original_conv1.bias
+        )
+        print("Modified ResNet-18 first conv layer for 2 input channels.")
+
+        # --- Replace the final fully connected layer ---
+        num_ftrs = model.fc.in_features # Get the number of features feeding into the original fc layer
+        model.fc = nn.Linear(num_ftrs, num_classes) # Create a new fc layer with the correct number of output classes
+        print(f"Replaced ResNet-18 final fc layer for {num_classes} classes.")
+
+    # Keep your VGG definitions if you want to switch back easily
+    elif model_name == 'vgg11':
         return lib.model_VGG2D.vgg11(num_classes=num_classes)
-    elif(model_name == 'vgg11_bn'):
+    elif model_name == 'vgg11_bn':
         return lib.model_VGG2D.vgg11_bn(num_classes=num_classes)
-    elif(model_name == 'vgg13'):
+    elif model_name == 'vgg13':
         return lib.model_VGG2D.vgg13(num_classes=num_classes)
-    elif(model_name == 'vgg13_bn'):
+    elif model_name == 'vgg13_bn':
         return lib.model_VGG2D.vgg13_bn(num_classes=num_classes)
-    elif(model_name == 'vgg16'):
+    elif model_name == 'vgg16':
         return lib.model_VGG2D.vgg16(num_classes=num_classes)
-    elif(model_name == 'vgg16_bn'):
+    elif model_name == 'vgg16_bn':
         return lib.model_VGG2D.vgg16_bn(num_classes=num_classes)
-    elif(model_name == 'vgg19'):
+    elif model_name == 'vgg19':
         return lib.model_VGG2D.vgg19(num_classes=num_classes)
-    elif(model_name == 'vgg19_bn'):
+    elif model_name == 'vgg19_bn':
         return lib.model_VGG2D.vgg19_bn(num_classes=num_classes)
+
     else:
-        print('Error: no valid model name:', model_name)
+        print(f"Error: Unsupported model name '{model_name}'")
         exit()
 
+    return model
 
-def train_model_observe_snr_performance_spec(model, criterion, optimizer, scheduler, num_classes, num_epochs, snr_list_for_observation):
+
+def train_model_observe_snr_performance_spec(model, criterion, optimizer, scheduler, dataloaders, dataset_sizes, num_classes, num_epochs, snr_list_for_observation):
     
     since = time.time()
     train_loss = []
@@ -384,22 +413,22 @@ data_path = './data/'
 
 # global params
 num_workers = 0 # number of workers for data loader
-num_folds = 1 # number of folds for cross validation
-num_epochs = 5 # number of epochs to train
-batch_size = 8 # batch size
-learning_rate = 0.005 # start learning rate
+num_folds = 1 # number of folds for cross validation - Changed from 2
+num_epochs = 10 # number of epochs to train - Changed from 20 to 10 for remaining run
+batch_size = 16 # batch size - Changed from 24
+learning_rate = 5e-4 # start learning rate
 train_verbose = True  # show epoch
-model_name = 'vgg11_bn'
+model_name = 'resnet18'
 
 # set device
 # device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-# device = torch.device('cpu')
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-# elif torch.cuda.is_available(): # Optional: Keep if you might run on CUDA machines too
-#     device = torch.device("cuda:0")
-else:
-    device = torch.device("cpu")
+device = torch.device('cpu') # Force CPU
+# elif torch.backends.mps.is_available():
+#     device = torch.device("mps")
+# # elif torch.cuda.is_available(): # Optional: Keep if you might run on CUDA machines too
+# #     device = torch.device("cuda:0")
+# else:
+#     device = torch.device("cpu")
 print(f"Using device: {device}") # Good practice to confirm which device is used
 
 experiment_name = model_name + \
@@ -413,18 +442,14 @@ print('Starting experiment:', experiment_name)
 
 # create path to store results
 act_result_path = result_path + experiment_name + '/'
-try:
-    os.mkdir(act_result_path)
-except OSError as error:
-    print(error)
-try:
-    os.mkdir(act_result_path + 'plots/')
-except OSError as error:
-    print(error)
+os.makedirs(act_result_path, exist_ok=True)
+os.makedirs(act_result_path + 'plots/', exist_ok=True)
 
 # read statistics/class count of the dataset
 dataset_stats = pd.read_csv(data_path + 'class_stats.csv', index_col=0)
 class_names = dataset_stats['class'].values
+num_classes = len(class_names) # Get num_classes from the definitive dataset stats
+print(f"Total number of classes based on class_stats.csv: {num_classes}")
 
 # read SNR count of the dataset
 snr_stats = pd.read_csv(data_path + 'SNR_stats.csv', index_col=0)
@@ -433,14 +458,64 @@ snr_list = snr_stats['SNR'].values
 # setup transform: IQ -> SPEC
 data_transform = transform_spectrogram(device=device) # create transform object
 # create dataset object
-drone_dataset = drone_data_dataset(path=data_path, device=device, transform=data_transform)
+full_drone_dataset = drone_data_dataset(path=data_path, device=device, transform=data_transform)
 
-# split data with stratified kfold
-dataset_indices = list(range(len(drone_dataset)))
+# --- ADD SUBSETTING LOGIC HERE ---
+# Example: Keep only 50% of the data, stratified by target class
+from sklearn.model_selection import train_test_split
 
-# targets = drone_dataset.get_targets()
-# snr_list = drone_dataset.get_snrs()
-# files = drone_dataset.get_files()
+dataset_size = len(full_drone_dataset)
+dataset_indices = list(range(dataset_size))
+dataset_targets = full_drone_dataset.get_targets() # Get all targets
+
+# Use train_test_split to get a stratified subset of indices to KEEP
+# We want to keep 50% (train_size=0.5), the other 50% are 'discarded_idx'
+# random_state ensures reproducibility
+indices_to_keep, discarded_idx = train_test_split(
+    dataset_indices,
+    train_size=0.5, # Keep 50%
+    stratify=dataset_targets,
+    random_state=42 # Or any integer
+)
+print(f"Original dataset size: {dataset_size}")
+print(f"Using subset size: {len(indices_to_keep)}")
+
+# Create the actual dataset object using only the selected indices
+drone_dataset = torch.utils.data.Subset(full_drone_dataset, indices_to_keep)
+
+# --- CONTINUE THE SCRIPT AS BEFORE ---
+# The rest of the script uses 'drone_dataset' which is now the subset
+
+# You might need to adjust how targets are retrieved for splitting if using the subset directly
+# The current splitting logic might need modification as drone_dataset is now a Subset object
+# It might be easier to get the subset indices FIRST, then apply those indices
+# during the train/val/test split generation instead of using the Subset object here.
+
+# --- For example, modify the splitting part: ---
+# Instead of splitting 'dataset_indices', split 'indices_to_keep'
+
+# train_val_idx_subset, test_idx_subset = train_test_split(
+#     indices_to_keep, # Split the indices we decided to keep
+#     test_size=0.1/0.5, # Adjust split fraction relative to subset size (e.g. 10% test of original = 20% of subset)
+#     stratify=[dataset_targets[i] for i in indices_to_keep], # Use targets corresponding to kept indices
+#     random_state=42
+# )
+# ... and so on for the train/val split ...
+
+# Then create Subsets using the original full_drone_dataset and the final split indices:
+# train_dataset = torch.utils.data.Subset(full_drone_dataset, final_train_indices)
+# val_dataset = torch.utils.data.Subset(full_drone_dataset, final_val_indices)
+# test_dataset = torch.utils.data.Subset(full_drone_dataset, final_test_indices)
+
+# Also recalculate class weights based ONLY on the 'indices_to_keep' subset for the sampler
+# class_counts_subset = pd.Series([dataset_targets[i] for i in indices_to_keep]).value_counts()
+# class_weights_subset = 1. / class_counts_subset
+# train_samples_weight = np.array([class_weights_subset[dataset_targets[i]] for i in final_train_indices])
+# ... etc ...
+
+# Extract targets ONLY for the kept indices
+subset_targets = [dataset_targets[i] for i in indices_to_keep]
+
 
 # fold=0
 for fold in range(num_folds):
@@ -449,19 +524,47 @@ for fold in range(num_folds):
     writer = SummaryWriter(act_result_path + 'runs/fold' + str(fold))
 
     if num_folds == 1:
-        print("Using single 80/10/10 train/val/test split.")
-        # Split into 90% train+val and 10% test
-        train_val_idx, test_idx = train_test_split(dataset_indices, test_size=0.1, stratify=drone_dataset.get_targets(), random_state=42) # Added random_state for reproducibility
-        y_test = [drone_dataset.get_targets()[x] for x in test_idx]
-        y_train_val = [drone_dataset.get_targets()[x] for x in train_val_idx]
+        print("Using single 80/10/10 train/val/test split on the 50% data subset.")
 
-        # Split 90% train+val into 80% train and 10% val (relative to original dataset size)
-        val_split_size = 0.1 / 0.9 # Calculate split fraction for validation set relative to train_val set
-        train_idx, val_idx = train_test_split(train_val_idx, test_size=val_split_size, stratify=y_train_val, random_state=42) # Added random_state
-        y_val = [drone_dataset.get_targets()[x] for x in val_idx]
-        y_train = [drone_dataset.get_targets()[x] for x in train_idx]
+        # --- MODIFIED SPLITTING LOGIC ---
+        # Split the 'indices_to_keep' (our 50% subset)
+        # Calculate split sizes relative to the subset size
+        test_split_fraction = 0.1 / 0.5 # 10% of original is 20% of the 50% subset
+        val_split_fraction_relative_to_train_val = (0.1 / 0.5) / (1.0 - test_split_fraction) # 10% val relative to the 80% train_val (of the subset)
 
-    else: # Original k-fold logic
+        # Split into preliminary train_val (80% of subset) and final test (20% of subset)
+        train_val_idx, test_idx = train_test_split(
+            indices_to_keep, # Operate on the subset indices
+            test_size=test_split_fraction,
+            stratify=subset_targets, # Use subset targets for stratification
+            random_state=42 # Added random_state for reproducibility
+        )
+        # Get targets corresponding to these new splits
+        y_test = [dataset_targets[i] for i in test_idx]
+        y_train_val = [dataset_targets[i] for i in train_val_idx]
+
+
+        # Split preliminary train_val into final train and val
+        train_idx, val_idx = train_test_split(
+            train_val_idx,
+            test_size=val_split_fraction_relative_to_train_val,
+            stratify=y_train_val, # Stratify based on train_val targets
+            random_state=42 # Added random_state
+        )
+        # Get final targets
+        y_val = [dataset_targets[i] for i in val_idx]
+        y_train = [dataset_targets[i] for i in train_idx]
+        # --- END MODIFIED SPLITTING LOGIC ---
+
+        # ---- DEBUG PRINTS (Optional) ----
+        # print(f"Subset size: {len(indices_to_keep)}")
+        # print(f"Train size: {len(train_idx)}")
+        # print(f"Val size: {len(val_idx)}")
+        # print(f"Test size: {len(test_idx)}")
+        # print(f"Total split size: {len(train_idx) + len(val_idx) + len(test_idx)}")
+        # ---- END DEBUG PRINTS ----
+
+    else: # Original k-fold logic (won't be used if num_folds=1)
         # split data with stratified kfold with respect to target class
         train_idx, test_idx = train_test_split(dataset_indices, test_size=1/num_folds, stratify=drone_dataset.get_targets())
         y_test = [drone_dataset.get_targets()[x] for x in test_idx]
@@ -472,47 +575,57 @@ for fold in range(num_folds):
         y_val = [drone_dataset.get_targets()[x] for x in val_idx]
         y_train = [drone_dataset.get_targets()[x] for x in train_idx]
 
-    # get train samples weight by class weight for each train target
-    class_weights = 1. / dataset_stats['count']
+    # --- MODIFIED WEIGHT CALCULATION ---
+    # Recalculate class weights based ONLY on the 'y_train' targets from the subset split
+    print("Calculating class weights for weighted sampler based on training subset...")
+    train_class_counts = pd.Series(y_train).value_counts().sort_index()
+    # Ensure all classes are present, handle potential missing classes if necessary
+    all_classes = range(num_classes)
+    train_class_counts = train_class_counts.reindex(all_classes, fill_value=0)
+    # Avoid division by zero for classes not present in the training split (shouldn't happen with stratification, but be safe)
+    class_weights = {cls: 1.0 / count if count > 0 else 0 for cls, count in train_class_counts.items()}
+    print(f"Subset train class counts:\n{train_class_counts}")
+    # Assign weights to each sample in the training set 'train_idx' using the new weights
+    train_samples_weight = np.array([class_weights[target] for target in y_train])
+    # --- END MODIFIED WEIGHT CALCULATION ---
 
-    train_samples_weight = np.array([class_weights[int(i)] for i in y_train])
     train_samples_weight = torch.from_numpy(train_samples_weight)
 
-    train_dataset = torch.utils.data.Subset(drone_dataset, train_idx)
-    val_dataset = torch.utils.data.Subset(drone_dataset, val_idx)
-    test_dataset = torch.utils.data.Subset(drone_dataset, test_idx)
+    # Create datasets using the FINAL indices and the ORIGINAL full dataset
+    # This avoids issues with nested Subset objects
+    train_dataset = torch.utils.data.Subset(full_drone_dataset, train_idx)
+    val_dataset = torch.utils.data.Subset(full_drone_dataset, val_idx)
+    test_dataset = torch.utils.data.Subset(full_drone_dataset, test_idx)
 
     # define weighted random sampler with the weighted train samples
     train_sampler = torch.utils.data.WeightedRandomSampler(train_samples_weight.type('torch.DoubleTensor'), len(train_samples_weight))
 
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        num_workers=num_workers, 
-        pin_memory=False)
+    # Create DataLoaders
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=num_workers)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers) # No sampler for validation
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers) # No sampler for test
 
-    val_loader = DataLoader(
-        dataset=val_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=False)
-
-    test_loader = DataLoader(
-        dataset=test_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=False)
-
-    dataloaders = {'train': train_loader, 'val': val_loader, 'test': test_loader}
+    dataloaders = {'train': train_dataloader, 'val': val_dataloader, 'test': test_dataloader}
     dataset_sizes = {'train': len(train_dataset), 'val': len(val_dataset), 'test': len(test_dataset)}
 
-    num_classes = len(np.unique(y_val))
-
-    model = get_model_spec(model_name, num_classes)
-    model = model.to(device)
+    if os.path.exists(act_result_path + 'model_fold' + str(fold) + '.pth'):
+        print(f"Loading existing model from fold {fold} to continue training...")
+        # Set weights_only=False to load model saved with older PyTorch versions
+        model = torch.load(act_result_path + 'model_fold' + str(fold) + '.pth', weights_only=False)
+        
+        # Quick validation to verify loaded model performance
+        model.eval()
+        with torch.no_grad():
+            sample_data = next(iter(dataloaders['val']))
+            _, _, _, _, inputs = sample_data
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            print(f"Loaded model is producing valid outputs: {outputs.shape}")
+        print("Continuing training with pre-trained model...")
+    else:
+        # Original model creation code
+        model = get_model_spec(model_name, num_classes)
+        model = model.to(device)
 
     # criterion = nn.CrossEntropyLoss(weight=torch.Tensor(class_weights).to(device))
     criterion = nn.CrossEntropyLoss()  # don't use class weights in the loss
@@ -522,14 +635,17 @@ for fold in range(num_folds):
     optimizer_ft = optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
     # Decay LR by a factor of 0.1 every 7 epochs
     # exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
-    # plateau_scheduler = lr_scheduler.ReduceLROnPlateau(optimizer_ft, mode='min', factor=0.1, patience=3, threshold=0.0001,
-                                                        # threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08, verbose=True)
+    # Use ReduceLROnPlateau - reduces learning rate when validation loss plateaus
+    plateau_scheduler = lr_scheduler.ReduceLROnPlateau(optimizer_ft, mode='min', factor=0.1, patience=3, threshold=0.0001,
+                                                       threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08)
                                                                                                     
     # train model
     model, train_loss, train_acc, val_loss, val_acc, train_weighted_acc, val_weighted_acc, best_epoch, lr = train_model_observe_snr_performance_spec(model=model,
                                                                                                                         criterion=criterion,
                                                                                                                         optimizer=optimizer_ft,
-                                                                                                                        scheduler=None,
+                                                                                                                        scheduler=plateau_scheduler,
+                                                                                                                        dataloaders=dataloaders,
+                                                                                                                        dataset_sizes=dataset_sizes,
                                                                                                                         num_classes=num_classes,
                                                                                                                         num_epochs=num_epochs,
                                                                                                                         snr_list_for_observation=[0, -10, -20])
@@ -559,11 +675,10 @@ for fold in range(num_folds):
     # plt.show()
 
     # store model
-    torch.save(model, act_result_path + 'model_fold' + str(fold) + '.pth')
+    torch.save(model, act_result_path + 'model_fold' + str(fold) + '.pth', _use_new_zipfile_serialization=False)
 
     # eval model on test data
     # # load best model
-    # model = torch.load(act_result_path + 'model.pth')
     eval_acc, eval_weighted_acc, eval_predictions, eval_targets, eval_snrs, eval_duty_cycle = eval_model_spec(model=model, num_classes=num_classes, data_loader=dataloaders['test'])
 
     eval_targets = eval_targets.cpu()
