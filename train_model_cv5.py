@@ -5,17 +5,14 @@ import os
 import time
 import torch
 import matplotlib.pyplot as plt
-from scipy import signal
 from torch.utils.data import Dataset, DataLoader
 from torchaudio.transforms import Spectrogram
-import lib.model_VGG2D
 from sklearn.model_selection import train_test_split
 
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import lr_scheduler
-import torch.backends.cudnn as cudnn
 from tqdm import tqdm  # progressbar
 import torchmetrics
 import pickle as pkl
@@ -23,24 +20,16 @@ import torchvision.models as models
 
 
 class drone_data_dataset(Dataset):
-    """
-    Dataset class for drone IQ Signals + transform to spectrogram
-    """
+    # Dataset for drone IQ signals with spectrogram transform
     def __init__(self, path, transform=None, device=None):
         self.path = path
-        self.files = os.listdir(path)
-        self.files = [f for f in self.files if f.endswith('pt')] # filter for files with .pt extension  
-        self.files = [f for f in self.files if f.startswith('IQdata_sample')] # filter for files which start with IQdata_sample in name
+        # load only relevant .pt files
+        self.files = [f for f in os.listdir(path) if f.endswith('pt') and f.startswith('IQdata_sample')]
         self.transform = transform
         self.device = device
-
-        # create list of tragets and snrs for all samples
-        self.targets = []
-        self.snrs = []
-        
-        for file in self.files:
-            self.targets.append(int(file.split('_')[2][6:])) # get target from file name
-            self.snrs.append(int(file.split('_')[3].split('.')[0][3:])) # get snr from file name
+        # parse targets and SNRs from filenames
+        self.targets = [int(f.split('_')[2][6:]) for f in self.files]
+        self.snrs = [int(f.split('_')[3].split('.')[0][3:]) for f in self.files]
 
     def __len__(self):
         return len(self.files)
@@ -67,110 +56,34 @@ class drone_data_dataset(Dataset):
 
     def get_snrs(self): # return list of snrs
         return self.snrs
-    
-    def get_files(self):
-        return self.files
 
 
 class transform_spectrogram(torch.nn.Module):
-    def __init__(
-        self,
-        device,
-        n_fft=1024,
-        win_length=1024,
-        hop_length=1024,
-        window_fn=torch.hann_window,
-        power=None, # Exponent for the magnitude spectrogram, (must be > 0) e.g., 1 for magnitude, 2 for power, etc. If None, then the complex spectrum is returned instead. (Default: 2)
-        normalized=False,
-        center=False,
-        #pad_mode='reflect',
-        onesided=False
-    ):
+    # Spectrogram transform for IQ signals
+    def __init__(self, device, n_fft=1024, win_length=1024, hop_length=1024):
         super().__init__()
-        self.spec = Spectrogram(n_fft=n_fft, win_length=win_length, hop_length=hop_length, window_fn=window_fn, power=power, normalized=normalized, center=center, onesided=onesided).to(device=device)   
-        self.win_lengt = win_length
+        self.spec = Spectrogram(n_fft=n_fft, win_length=win_length, hop_length=hop_length,
+                                 window_fn=torch.hann_window, power=None,
+                                 normalized=False, center=False, onesided=False).to(device)
+        self.win_length = win_length
 
     def forward(self, iq_signal: torch.Tensor) -> torch.Tensor:
-        # Convert to spectrogram
-        iq_signal = iq_signal[0,:] + (1j * iq_signal[1,:]) # convert to complex signal
+        # Convert IQ to real-imag spectrogram
+        iq_signal = iq_signal[0,:] + (1j * iq_signal[1,:])
         spec = self.spec(iq_signal)
-        spec = torch.view_as_real(spec) # Returns a view of a complex input as a real tensor. last dimension of size 2 represents the real and imaginary components of complex numbers
-        spec = torch.moveaxis(spec,2,0) # move channel dimension to first dimension (1024, 1024, 2) -> (2, 1024, 1024)
-        spec = spec/self.win_lengt # normalise by fft window size
+        spec = torch.view_as_real(spec)
+        spec = torch.moveaxis(spec,2,0)
+        spec = spec / self.win_length
         return spec
 
 
-def plot_two_channel_spectrogram(spectrogram_2d, title='', figsize=(10,6)):
-    figure, axis = plt.subplots(1, 2, figsize=figsize)
-    re = axis[0].imshow(spectrogram_2d[0,:,:]) #, aspect='auto', origin='lower')
-    axis[0].set_title("Re")
-    figure.colorbar(re, ax=axis[0], location='right', shrink=0.5)
-
-    im = axis[1].imshow(spectrogram_2d[1,:,:]) #, aspect='auto', origin='lower')
-    axis[1].set_title("Im")
-    figure.colorbar(im, ax=axis[1], location='right', shrink=0.5)
-
-    figure.suptitle(title)
-    plt.show()
-
-
-def plot_two_channel_iq(iq_2d, title='', figsize=(10,6)):
-    figure, axis = plt.subplots(2, 1, figsize=figsize)
-    axis[0].plot(iq_2d[0,:]) 
-    axis[0].set_title("Re")
-    axis[1].plot(iq_2d[1,:])
-    axis[1].set_title("Im")
-    figure.suptitle(title)
-    plt.show()
-
-
 def get_model_spec(model_name, num_classes):
-    if model_name == 'resnet18':
-        # Load the ResNet-18 architecture. pretrained=False means random initialization.
-        # Set pretrained=True if you want to leverage ImageNet weights (might need adjustment)
-        model = models.resnet18(weights=None) # Use weights=None for random init
-
-        # --- Modify the first convolutional layer for 2-channel input ---
-        # Original ResNet-18 conv1: nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        # We need to change the input channels from 3 to 2
-        original_conv1 = model.conv1
-        model.conv1 = nn.Conv2d(
-            in_channels=2, # Change this from 3 to 2
-            out_channels=original_conv1.out_channels,
-            kernel_size=original_conv1.kernel_size,
-            stride=original_conv1.stride,
-            padding=original_conv1.padding,
-            bias=original_conv1.bias
-        )
-        print("Modified ResNet-18 first conv layer for 2 input channels.")
-
-        # --- Replace the final fully connected layer ---
-        num_ftrs = model.fc.in_features # Get the number of features feeding into the original fc layer
-        model.fc = nn.Linear(num_ftrs, num_classes) # Create a new fc layer with the correct number of output classes
-        print(f"Replaced ResNet-18 final fc layer for {num_classes} classes.")
-
-    # Keep your VGG definitions if you want to switch back easily
-    elif model_name == 'vgg11':
-        return lib.model_VGG2D.vgg11(num_classes=num_classes)
-    elif model_name == 'vgg11_bn':
-        return lib.model_VGG2D.vgg11_bn(num_classes=num_classes)
-    elif model_name == 'vgg13':
-        return lib.model_VGG2D.vgg13(num_classes=num_classes)
-    elif model_name == 'vgg13_bn':
-        return lib.model_VGG2D.vgg13_bn(num_classes=num_classes)
-    elif model_name == 'vgg16':
-        return lib.model_VGG2D.vgg16(num_classes=num_classes)
-    elif model_name == 'vgg16_bn':
-        return lib.model_VGG2D.vgg16_bn(num_classes=num_classes)
-    elif model_name == 'vgg19':
-        return lib.model_VGG2D.vgg19(num_classes=num_classes)
-    elif model_name == 'vgg19_bn':
-        return lib.model_VGG2D.vgg19_bn(num_classes=num_classes)
-
-    else:
-        print(f"Error: Unsupported model name '{model_name}'")
-        exit()
-
+    # Only ResNet-18 supported
+    model = models.resnet18(weights=None)
+    conv = model.conv1
+    model.conv1 = nn.Conv2d(2, conv.out_channels, conv.kernel_size, conv.stride, conv.padding, conv.bias)
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, num_classes)
     return model
 
 
@@ -215,18 +128,13 @@ def train_model_observe_snr_performance_spec(model, criterion, optimizer, schedu
         snr_epoch_acc = torch.zeros([num_snrs_to_observe], dtype=torch.float)
         snr_epoch_weighted_acc = torch.zeros([num_snrs_to_observe], dtype=torch.float)
 
-        # Each epoch has a training and validation phase
+        # Training and validation phases
         for phase in ['train', 'val']:
-            # phase = 'train'
             if phase == 'train':
-                model.train()  # Set model to training mode
+                model.train()
                 running_loss = 0.0
-                epoch_train_loop = tqdm(dataloaders[phase])  # setup progress bar
+                epoch_train_loop = tqdm(dataloaders[phase])  # training loop
 
-                # iterate over data of the epoch (training)
-                # inputs, labels, snrs = next(iter(epoch_train_loop))
-                # for batch_id, (inputs_iq, inputs_spec, labels, snrs, duty_cycles) in enumerate(epoch_train_loop):
-                # iq_data, target, act_snr, sample_id, transformed_data = next(iter(epoch_train_loop))
                 for batch_id, (iq_data, target, act_snr, sample_id, transformed_data) in enumerate(epoch_train_loop):
                     inputs = transformed_data.to(device)
                     labels = target.to(device)
@@ -238,7 +146,6 @@ def train_model_observe_snr_performance_spec(model, criterion, optimizer, schedu
                     # zero the parameter gradients
                     optimizer.zero_grad()
                     # forward
-                    # track history if only in train
                     with torch.set_grad_enabled(True):
                         outputs = model(inputs)
                         _, preds = torch.max(outputs, 1)
@@ -254,15 +161,9 @@ def train_model_observe_snr_performance_spec(model, criterion, optimizer, schedu
                     train_metric_acc.update(preds, labels.data)
                     train_metric_weighted_acc.update(preds, labels.data)
 
-                    # print(f"Accuracy on batch: {batch_train_acc}")
-                    if train_verbose:
-                        # show progress bar for the epoch
-                        epoch_train_loop.set_description(f'Epoch [{epoch}/{num_epochs}]')
-                        # epoch_train_loop.set_postfix(loss=loss.item(), acc=torch.sum(preds == labels.data).item()/batch_size)
-                        epoch_train_loop.set_postfix()
-
-                # apply learning rate scheduler after training epoch (for exp_lr_scheduler)
-                # scheduler.step()
+                    # update progress bar
+                    epoch_train_loop.set_description(f'Epoch [{epoch}/{num_epochs}]')
+                    epoch_train_loop.set_postfix()
 
                 # compute and show metrics for the epoch
                 epoch_loss = running_loss / dataset_sizes[phase]
@@ -327,7 +228,8 @@ def train_model_observe_snr_performance_spec(model, criterion, optimizer, schedu
 
                 # apply LR scheduler ... looking for plateau in val loss
                 if scheduler:
-                    scheduler.step(epoch_loss)
+                    # Removed unused scheduler step
+                    pass
 
                 print('{} Loss: {:.4f} Acc: {:.4f}  Balanced Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc, epoch_weighted_acc))
                 # store validation loss
@@ -357,7 +259,6 @@ def train_model_observe_snr_performance_spec(model, criterion, optimizer, schedu
     print('Best val Acc: {:4f}'.format(best_acc))
     print('Best epoch: {}'.format(best_epoch))
 
-    # load best model weights
     model.load_state_dict(best_model_wts)
 
     return model, train_loss, train_acc, val_loss, val_acc, train_weighted_acc, val_weighted_acc, best_epoch, lr
@@ -371,16 +272,12 @@ def eval_model_spec(model, num_classes, data_loader):
     eval_snrs = torch.empty(0, device=device)
     eval_duty_cycle = torch.empty(0, device=device)
 
-    # initialize metric
     eval_metric_acc = torchmetrics.Accuracy(task='multiclass', num_classes=num_classes,).to(device) # accuracy
 
-    # 'macro': Calculate the metric for each class separately, and average the metrics across classes (with equal weights for each class).
     eval_metric_weighted_acc = torchmetrics.Accuracy(task='multiclass', num_classes=num_classes, average='macro').to(device) # weigthed accuracy
 
-    # evaluate the model
     model.eval()  # Set model to evaluate mode
 
-    # iterate over data of the epoch (evaluation)
     for batch_id, (iq_data, target, act_snr, sample_id, transformed_data) in enumerate(data_loader):
         inputs = transformed_data.to(device)
         labels = target.to(device)
@@ -421,15 +318,8 @@ train_verbose = True  # show epoch
 model_name = 'resnet18'
 
 # set device
-# device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-device = torch.device('cpu') # Force CPU
-# elif torch.backends.mps.is_available():
-#     device = torch.device("mps")
-# # elif torch.cuda.is_available(): # Optional: Keep if you might run on CUDA machines too
-# #     device = torch.device("cuda:0")
-# else:
-#     device = torch.device("cpu")
-print(f"Using device: {device}") # Good practice to confirm which device is used
+device = torch.device('cpu')  # Force CPU
+print(f"Using device: {device}")
 
 experiment_name = model_name + \
                 '_CV' + str(num_folds) +\
@@ -460,61 +350,10 @@ data_transform = transform_spectrogram(device=device) # create transform object
 # create dataset object
 full_drone_dataset = drone_data_dataset(path=data_path, device=device, transform=data_transform)
 
-# --- ADD SUBSETTING LOGIC HERE ---
-# Example: Keep only 50% of the data, stratified by target class
-from sklearn.model_selection import train_test_split
-
+# Setup full dataset indices for splitting
 dataset_size = len(full_drone_dataset)
 dataset_indices = list(range(dataset_size))
-dataset_targets = full_drone_dataset.get_targets() # Get all targets
-
-# Use train_test_split to get a stratified subset of indices to KEEP
-# We want to keep 50% (train_size=0.5), the other 50% are 'discarded_idx'
-# random_state ensures reproducibility
-indices_to_keep, discarded_idx = train_test_split(
-    dataset_indices,
-    train_size=0.5, # Keep 50%
-    stratify=dataset_targets,
-    random_state=42 # Or any integer
-)
-print(f"Original dataset size: {dataset_size}")
-print(f"Using subset size: {len(indices_to_keep)}")
-
-# Create the actual dataset object using only the selected indices
-drone_dataset = torch.utils.data.Subset(full_drone_dataset, indices_to_keep)
-
-# --- CONTINUE THE SCRIPT AS BEFORE ---
-# The rest of the script uses 'drone_dataset' which is now the subset
-
-# You might need to adjust how targets are retrieved for splitting if using the subset directly
-# The current splitting logic might need modification as drone_dataset is now a Subset object
-# It might be easier to get the subset indices FIRST, then apply those indices
-# during the train/val/test split generation instead of using the Subset object here.
-
-# --- For example, modify the splitting part: ---
-# Instead of splitting 'dataset_indices', split 'indices_to_keep'
-
-# train_val_idx_subset, test_idx_subset = train_test_split(
-#     indices_to_keep, # Split the indices we decided to keep
-#     test_size=0.1/0.5, # Adjust split fraction relative to subset size (e.g. 10% test of original = 20% of subset)
-#     stratify=[dataset_targets[i] for i in indices_to_keep], # Use targets corresponding to kept indices
-#     random_state=42
-# )
-# ... and so on for the train/val split ...
-
-# Then create Subsets using the original full_drone_dataset and the final split indices:
-# train_dataset = torch.utils.data.Subset(full_drone_dataset, final_train_indices)
-# val_dataset = torch.utils.data.Subset(full_drone_dataset, final_val_indices)
-# test_dataset = torch.utils.data.Subset(full_drone_dataset, final_test_indices)
-
-# Also recalculate class weights based ONLY on the 'indices_to_keep' subset for the sampler
-# class_counts_subset = pd.Series([dataset_targets[i] for i in indices_to_keep]).value_counts()
-# class_weights_subset = 1. / class_counts_subset
-# train_samples_weight = np.array([class_weights_subset[dataset_targets[i]] for i in final_train_indices])
-# ... etc ...
-
-# Extract targets ONLY for the kept indices
-subset_targets = [dataset_targets[i] for i in indices_to_keep]
+dataset_targets = full_drone_dataset.get_targets()
 
 
 # fold=0
@@ -524,56 +363,35 @@ for fold in range(num_folds):
     writer = SummaryWriter(act_result_path + 'runs/fold' + str(fold))
 
     if num_folds == 1:
-        print("Using single 80/10/10 train/val/test split on the 50% data subset.")
-
-        # --- MODIFIED SPLITTING LOGIC ---
-        # Split the 'indices_to_keep' (our 50% subset)
-        # Calculate split sizes relative to the subset size
-        test_split_fraction = 0.1 / 0.5 # 10% of original is 20% of the 50% subset
-        val_split_fraction_relative_to_train_val = (0.1 / 0.5) / (1.0 - test_split_fraction) # 10% val relative to the 80% train_val (of the subset)
-
-        # Split into preliminary train_val (80% of subset) and final test (20% of subset)
+        print("Using single 80/10/10 train/val/test split on the full dataset.")
+        # Split full dataset: 80% train_val, 10% test, then 80/10 train/val within train_val
+        test_split_fraction = 0.1
+        val_split_fraction_relative_to_train_val = test_split_fraction / (1 - test_split_fraction)
         train_val_idx, test_idx = train_test_split(
-            indices_to_keep, # Operate on the subset indices
+            dataset_indices,
             test_size=test_split_fraction,
-            stratify=subset_targets, # Use subset targets for stratification
-            random_state=42 # Added random_state for reproducibility
+            stratify=dataset_targets,
+            random_state=42
         )
-        # Get targets corresponding to these new splits
         y_test = [dataset_targets[i] for i in test_idx]
         y_train_val = [dataset_targets[i] for i in train_val_idx]
-
-
-        # Split preliminary train_val into final train and val
         train_idx, val_idx = train_test_split(
             train_val_idx,
             test_size=val_split_fraction_relative_to_train_val,
-            stratify=y_train_val, # Stratify based on train_val targets
-            random_state=42 # Added random_state
+            stratify=y_train_val,
+            random_state=42
         )
-        # Get final targets
-        y_val = [dataset_targets[i] for i in val_idx]
         y_train = [dataset_targets[i] for i in train_idx]
-        # --- END MODIFIED SPLITTING LOGIC ---
-
-        # ---- DEBUG PRINTS (Optional) ----
-        # print(f"Subset size: {len(indices_to_keep)}")
-        # print(f"Train size: {len(train_idx)}")
-        # print(f"Val size: {len(val_idx)}")
-        # print(f"Test size: {len(test_idx)}")
-        # print(f"Total split size: {len(train_idx) + len(val_idx) + len(test_idx)}")
-        # ---- END DEBUG PRINTS ----
-
+        y_val = [dataset_targets[i] for i in val_idx]
     else: # Original k-fold logic (won't be used if num_folds=1)
-        # split data with stratified kfold with respect to target class
-        train_idx, test_idx = train_test_split(dataset_indices, test_size=1/num_folds, stratify=drone_dataset.get_targets())
-        y_test = [drone_dataset.get_targets()[x] for x in test_idx]
-        y_train = [drone_dataset.get_targets()[x] for x in train_idx]
+        train_idx, test_idx = train_test_split(dataset_indices, test_size=1/num_folds, stratify=full_drone_dataset.get_targets())
+        y_test = [full_drone_dataset.get_targets()[x] for x in test_idx]
+        y_train = [full_drone_dataset.get_targets()[x] for x in train_idx]
 
         # split val data from train data in stratified k-fold manner
         train_idx, val_idx = train_test_split(train_idx, test_size=1/num_folds, stratify=y_train)
-        y_val = [drone_dataset.get_targets()[x] for x in val_idx]
-        y_train = [drone_dataset.get_targets()[x] for x in train_idx]
+        y_val = [full_drone_dataset.get_targets()[x] for x in val_idx]
+        y_train = [full_drone_dataset.get_targets()[x] for x in train_idx]
 
     # --- MODIFIED WEIGHT CALCULATION ---
     # Recalculate class weights based ONLY on the 'y_train' targets from the subset split
@@ -630,11 +448,7 @@ for fold in range(num_folds):
     # criterion = nn.CrossEntropyLoss(weight=torch.Tensor(class_weights).to(device))
     criterion = nn.CrossEntropyLoss()  # don't use class weights in the loss
 
-    # Observe that all parameters are being optimized
-    # optimizer_ft = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
     optimizer_ft = optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=0, amsgrad=False)
-    # Decay LR by a factor of 0.1 every 7 epochs
-    # exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
     # Use ReduceLROnPlateau - reduces learning rate when validation loss plateaus
     plateau_scheduler = lr_scheduler.ReduceLROnPlateau(optimizer_ft, mode='min', factor=0.1, patience=3, threshold=0.0001,
                                                        threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08)
